@@ -1,0 +1,245 @@
+diff --git a/src/execution/operator/aggregate/CMakeLists.txt b/src/execution/operator/aggregate/CMakeLists.txt
+index 0e342f004334..70d37f48e347 100644
+--- a/src/execution/operator/aggregate/CMakeLists.txt
++++ b/src/execution/operator/aggregate/CMakeLists.txt
+@@ -2,6 +2,8 @@ add_library_unity(
+   duckdb_operator_aggregate
+   OBJECT
+   aggregate_object.cpp
++  physical_demand_scout_topk.cpp
++  physical_demand_burst.cpp
+   distinct_aggregate_data.cpp
+   physical_hash_aggregate.cpp
+   physical_limited_distinct.cpp
+diff --git a/src/execution/physical_plan/plan_aggregate.cpp b/src/execution/physical_plan/plan_aggregate.cpp
+index 2a127920d8da..f91439c1f014 100644
+--- a/src/execution/physical_plan/plan_aggregate.cpp
++++ b/src/execution/physical_plan/plan_aggregate.cpp
+@@ -5,13 +5,24 @@
+ #include "duckdb/execution/operator/aggregate/physical_perfecthash_aggregate.hpp"
+ #include "duckdb/execution/operator/aggregate/physical_ungrouped_aggregate.hpp"
+ #include "duckdb/execution/operator/aggregate/physical_partitioned_aggregate.hpp"
++#include "duckdb/execution/operator/aggregate/physical_demand_scout_topk.hpp"
++#include "duckdb/execution/operator/aggregate/physical_demand_burst.hpp"
+ #include "duckdb/execution/operator/projection/physical_projection.hpp"
+ #include "duckdb/execution/operator/scan/physical_table_scan.hpp"
+ #include "duckdb/execution/physical_plan_generator.hpp"
+ #include "duckdb/function/function_binder.hpp"
+ #include "duckdb/main/client_context.hpp"
+ #include "duckdb/planner/expression/bound_reference_expression.hpp"
++#include "duckdb/planner/expression/bound_constant_expression.hpp"
++#include "duckdb/planner/expression/bound_aggregate_expression.hpp"
++#include "duckdb/planner/expression/bound_function_expression.hpp"
+ #include "duckdb/planner/operator/logical_aggregate.hpp"
++#include "duckdb/function/table/table_scan.hpp"
++#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
++#include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
++#include "duckdb/storage/statistics/numeric_stats.hpp"
++
++#include <cstdlib>
+ 
+ namespace duckdb {
+ 
+@@ -246,10 +257,186 @@ static bool CanUsePerfectHashAggregate(ClientContext &context, LogicalAggregate
+ 	return true;
+ }
+ 
++struct DemandScoutMatch {
++	optional_ptr<TableCatalogEntry> table;
++	column_t group_column = 0;
++	ColumnIndex group_scan_column;
++	ColumnIndex score_scan_column;
++	int32_t group_min = 0;
++	idx_t group_domain = 0;
++	idx_t k = 0;
++	bool score_unsigned = false;
++	bool late_fetch = false;
++	LogicalType payload_type;
++	vector<column_t> payload_columns;
++};
++
++static DemandScoutMatch MatchDemandScout(ClientContext &context, LogicalAggregate &op, PhysicalOperator &child) {
++	DemandScoutMatch result;
++	auto enabled = std::getenv("DUCKDB_DEMAND_SCOUT_TOPK");
++	if (!enabled || std::string(enabled) != "1") {
++		return result;
++	}
++	if (child.type != PhysicalOperatorType::TABLE_SCAN || op.groups.size() != 1 || op.expressions.size() != 1 ||
++	    op.grouping_sets.size() > 1 || !op.grouping_functions.empty() ||
++	    op.groups[0]->GetExpressionClass() != ExpressionClass::BOUND_REF ||
++	    op.expressions[0]->GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE || op.types.size() != 2 ||
++	    op.types[0] != LogicalType::INTEGER || op.types[1].id() != LogicalTypeId::LIST) {
++		return result;
++	}
++	auto &aggregate = op.expressions[0]->Cast<BoundAggregateExpression>();
++	if (aggregate.Function().GetName() != "arg_max" || aggregate.IsDistinct() || aggregate.GetFilter() ||
++	    aggregate.GetOrderBys() || aggregate.GetChildren().size() != 3 ||
++	    aggregate.GetChildren()[1]->GetExpressionClass() != ExpressionClass::BOUND_REF ||
++	    aggregate.GetChildren()[2]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
++		return result;
++	}
++	auto &scan = child.Cast<PhysicalTableScan>();
++	if (scan.function.GetName() != "seq_scan" || !scan.bind_data ||
++	    (scan.table_filters && scan.table_filters->HasFilters()) ||
++	    (scan.dynamic_filters && scan.dynamic_filters->HasFilters()) || scan.extra_info.sample_options) {
++		return result;
++	}
++	auto &table = scan.bind_data->Cast<TableScanBindData>().table;
++	auto map_column = [&](const Expression &expression) -> optional_ptr<const ColumnIndex> {
++		auto index = expression.Cast<BoundReferenceExpression>().Index();
++		if (!scan.projection_ids.empty()) {
++			if (index >= scan.projection_ids.size()) {
++				return nullptr;
++			}
++			index = scan.projection_ids[index];
++		}
++		if (index >= scan.column_ids.size() || !scan.column_ids[index].HasPrimaryIndex()) {
++			return nullptr;
++		}
++		return scan.column_ids[index];
++	};
++	auto &payload_expression = *aggregate.GetChildren()[0];
++	const auto &payload_type = ListType::GetChildType(op.types[1]);
++	if (payload_type.id() == LogicalTypeId::STRUCT &&
++	    payload_expression.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
++		auto &function = payload_expression.Cast<BoundFunctionExpression>();
++		if (function.Function().GetName() != "struct_pack" || function.GetChildren().empty() ||
++		    function.GetChildren().size() != StructType::GetChildTypes(payload_type).size() ||
++		    function.GetChildren().size() > 7) {
++			return result;
++		}
++		for (idx_t field_index = 0; field_index < function.GetChildren().size(); ++field_index) {
++			auto &field = function.GetChildren()[field_index];
++			if (field->GetExpressionClass() != ExpressionClass::BOUND_REF) {
++				return result;
++			}
++			auto column = map_column(*field);
++			const auto expected_type = field_index == 0 ? LogicalType::BIGINT : LogicalType::DOUBLE;
++			if (!column || field->GetReturnType() != expected_type) {
++				return result;
++			}
++			auto storage_index = table.GetStorageIndex(*column);
++			if (!storage_index.HasPrimaryIndex() || storage_index.IsRowIdColumn() ||
++			    storage_index.IsRowNumberColumn()) {
++				return result;
++			}
++			result.payload_columns.push_back(NumericCast<column_t>(storage_index.GetPrimaryIndex()));
++		}
++		result.late_fetch = true;
++		result.payload_type = payload_type;
++	} else {
++		return result;
++	}
++	auto group_column = map_column(*op.groups[0]);
++	auto score_column = map_column(*aggregate.GetChildren()[1]);
++	if (!group_column || !score_column ||
++	    (aggregate.GetChildren()[1]->GetReturnType() != LogicalType::BIGINT &&
++	     aggregate.GetChildren()[1]->GetReturnType() != LogicalType::UBIGINT)) {
++		return result;
++	}
++	auto group_storage = table.GetStorageIndex(*group_column);
++	if (!group_storage.HasPrimaryIndex() || group_storage.IsRowIdColumn() || group_storage.IsRowNumberColumn()) {
++		return result;
++	}
++	// TableCatalogEntry statistics include transaction-local inserts; storage-only
++	// statistics can understate the group range and reject a visible local row.
++	auto statistics = table.Cast<DuckTableEntry>().GetStatistics(context, group_storage);
++	if (!statistics || !NumericStats::HasMinMax(*statistics)) {
++		return result;
++	}
++	const auto group_min = NumericStats::GetMin<int32_t>(*statistics);
++	const auto group_max = NumericStats::GetMax<int32_t>(*statistics);
++	const auto group_range = static_cast<int64_t>(group_max) - static_cast<int64_t>(group_min) + 1;
++	static constexpr int64_t MAX_GROUP_DOMAIN = 1000000;
++	if (group_range <= 0 || group_range > MAX_GROUP_DOMAIN) {
++		return result;
++	}
++	const auto k_value = aggregate.GetChildren()[2]->Cast<BoundConstantExpression>().GetValue();
++	if (k_value.IsNull()) {
++		return result;
++	}
++	const auto k = k_value.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
++	if (k < 1 || k > 10) {
++		return result;
++	}
++	result.table = table;
++	result.group_column = NumericCast<column_t>(group_storage.GetPrimaryIndex());
++	result.group_scan_column = *group_column;
++	result.score_scan_column = *score_column;
++	result.group_min = group_min;
++	result.group_domain = NumericCast<idx_t>(group_range);
++	result.k = NumericCast<idx_t>(k);
++	result.score_unsigned = aggregate.GetChildren()[1]->GetReturnType() == LogicalType::UBIGINT;
++	const auto unique_score = std::getenv("DUCKDB_DEMAND_ASSUME_UNIQUE_SCORE");
++	if (!unique_score || std::string(unique_score) != "1") {
++		return DemandScoutMatch();
++	}
++	return result;
++}
++
+ PhysicalOperator &PhysicalPlanGenerator::CreatePlan(LogicalAggregate &op) {
+ 	D_ASSERT(op.children.size() == 1);
+ 
+ 	reference<PhysicalOperator> plan = CreatePlan(*op.children[0]);
++	auto demand_match = MatchDemandScout(context, op, plan);
++	auto use_demand = bool(demand_match.table);
++	if (use_demand) {
++		const auto input_cardinality = plan.get().estimated_cardinality;
++		if (demand_match.late_fetch) {
++			auto &aggregate = op.expressions[0]->Cast<BoundAggregateExpression>();
++			auto &scan = plan.get().Cast<PhysicalTableScan>();
++			scan.column_ids = {demand_match.group_scan_column, ColumnIndex(COLUMN_IDENTIFIER_ROW_ID),
++			                   demand_match.score_scan_column};
++			scan.types = {LogicalType::INTEGER, LogicalType::ROW_TYPE, aggregate.GetChildren()[1]->GetReturnType()};
++			scan.projection_ids = {0, 1, 2};
++			auto &bind_columns = scan.bind_data->Cast<TableScanBindData>().column_ids;
++			bind_columns.clear();
++			for (const auto &column : scan.column_ids) {
++				bind_columns.push_back(NumericCast<column_t>(column.GetPrimaryIndex()));
++			}
++			vector<unique_ptr<Expression>> selections;
++			selections.push_back(make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 0));
++			selections.push_back(make_uniq<BoundReferenceExpression>(LogicalType::ROW_TYPE, 1));
++			selections.push_back(make_uniq<BoundReferenceExpression>(aggregate.GetChildren()[1]->GetReturnType(), 2));
++			selections.push_back(aggregate.GetChildren()[2]->Copy());
++			vector<LogicalType> key_types {LogicalType::INTEGER, LogicalType::BIGINT,
++			                               aggregate.GetChildren()[1]->GetReturnType(),
++			                               aggregate.GetChildren()[2]->GetReturnType()};
++			auto &projection = Make<PhysicalProjection>(std::move(key_types), std::move(selections), input_cardinality);
++			projection.children.push_back(plan);
++			const auto fused_option = std::getenv("DUCKDB_DEMAND_FUSED_HANDOFF");
++			const bool fused_handoff = fused_option && fused_option[0] == '1';
++			vector<LogicalType> winner_types {LogicalType::INTEGER};
++			if (!fused_handoff) {
++				winner_types.push_back(LogicalType::LIST(LogicalType::BIGINT));
++			}
++			auto &topk = Make<PhysicalDemandScoutTopK>(std::move(winner_types), op.estimated_cardinality, *demand_match.table,
++			                                        demand_match.group_column, demand_match.group_min, demand_match.group_domain,
++			                                        demand_match.k, input_cardinality, demand_match.score_unsigned, fused_handoff);
++			topk.children.push_back(projection);
++			auto &burst = Make<PhysicalDemandBurst>(op.types, op.estimated_cardinality, *demand_match.table,
++			                                           demand_match.payload_type, std::move(demand_match.payload_columns),
++			                                           fused_handoff);
++			burst.children.push_back(topk);
++			return burst;
++		}
++	}
+ 	plan = ExtractAggregateExpressions(plan, op.expressions, op.groups, op.grouping_sets);
+ 
+ 	bool can_use_simple_aggregation = true;
+diff --git a/src/include/duckdb/storage/table/row_group.hpp b/src/include/duckdb/storage/table/row_group.hpp
+index 644278d207c3..075c78aa9b17 100644
+--- a/src/include/duckdb/storage/table/row_group.hpp
++++ b/src/include/duckdb/storage/table/row_group.hpp
+@@ -144,6 +144,11 @@ public:
+ 	RowGroupCollection &GetCollection() const {
+ 		return collection.get();
+ 	}
++	//! Research access for a block-local demand producer/decoder. The caller must hold a
++	//! stable read transaction and must not mutate the returned column.
++	ColumnData &GetColumnForDemand(storage_t column_index) const {
++		return GetColumn(column_index);
++	}
+ 	//! Compute per-column metadata blocks by reading column metadata from disk
+ 	PerColumnMetadataBlocks ComputePerColumnMetadataBlocks() const;
+ 
