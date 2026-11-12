@@ -12,16 +12,17 @@ index 0e342f004334..70d37f48e347 100644
    physical_hash_aggregate.cpp
    physical_limited_distinct.cpp
 diff --git a/src/execution/physical_plan/plan_aggregate.cpp b/src/execution/physical_plan/plan_aggregate.cpp
-index 2a127920d8da..f91439c1f014 100644
+index 2a127920d8da..cc0b91aa97c2 100644
 --- a/src/execution/physical_plan/plan_aggregate.cpp
 +++ b/src/execution/physical_plan/plan_aggregate.cpp
-@@ -5,13 +5,24 @@
+@@ -5,13 +5,25 @@
  #include "duckdb/execution/operator/aggregate/physical_perfecthash_aggregate.hpp"
  #include "duckdb/execution/operator/aggregate/physical_ungrouped_aggregate.hpp"
  #include "duckdb/execution/operator/aggregate/physical_partitioned_aggregate.hpp"
 +#include "duckdb/execution/operator/aggregate/physical_demand_scout_topk.hpp"
 +#include "duckdb/execution/operator/aggregate/physical_demand_burst.hpp"
  #include "duckdb/execution/operator/projection/physical_projection.hpp"
++#include "duckdb/execution/operator/scan/physical_dummy_scan.hpp"
  #include "duckdb/execution/operator/scan/physical_table_scan.hpp"
  #include "duckdb/execution/physical_plan_generator.hpp"
  #include "duckdb/function/function_binder.hpp"
@@ -40,13 +41,14 @@ index 2a127920d8da..f91439c1f014 100644
  
  namespace duckdb {
  
-@@ -246,10 +257,186 @@ static bool CanUsePerfectHashAggregate(ClientContext &context, LogicalAggregate
+@@ -246,10 +258,202 @@ static bool CanUsePerfectHashAggregate(ClientContext &context, LogicalAggregate
  	return true;
  }
  
 +struct DemandScoutMatch {
 +	optional_ptr<TableCatalogEntry> table;
 +	column_t group_column = 0;
++	column_t score_column = 0;
 +	ColumnIndex group_scan_column;
 +	ColumnIndex score_scan_column;
 +	int32_t group_min = 0;
@@ -138,7 +140,9 @@ index 2a127920d8da..f91439c1f014 100644
 +		return result;
 +	}
 +	auto group_storage = table.GetStorageIndex(*group_column);
-+	if (!group_storage.HasPrimaryIndex() || group_storage.IsRowIdColumn() || group_storage.IsRowNumberColumn()) {
++	auto score_storage = table.GetStorageIndex(*score_column);
++	if (!group_storage.HasPrimaryIndex() || group_storage.IsRowIdColumn() || group_storage.IsRowNumberColumn() ||
++	    !score_storage.HasPrimaryIndex() || score_storage.IsRowIdColumn() || score_storage.IsRowNumberColumn()) {
 +		return result;
 +	}
 +	// TableCatalogEntry statistics include transaction-local inserts; storage-only
@@ -164,6 +168,7 @@ index 2a127920d8da..f91439c1f014 100644
 +	}
 +	result.table = table;
 +	result.group_column = NumericCast<column_t>(group_storage.GetPrimaryIndex());
++	result.score_column = NumericCast<column_t>(score_storage.GetPrimaryIndex());
 +	result.group_scan_column = *group_column;
 +	result.score_scan_column = *score_column;
 +	result.group_min = group_min;
@@ -187,26 +192,37 @@ index 2a127920d8da..f91439c1f014 100644
 +		const auto input_cardinality = plan.get().estimated_cardinality;
 +		if (demand_match.late_fetch) {
 +			auto &aggregate = op.expressions[0]->Cast<BoundAggregateExpression>();
++			const auto force = std::getenv("DUCKDB_DEMAND_SCOUT_FORCE");
++			const bool owned = force && std::string(force) == "OWNED";
 +			auto &scan = plan.get().Cast<PhysicalTableScan>();
-+			scan.column_ids = {demand_match.group_scan_column, ColumnIndex(COLUMN_IDENTIFIER_ROW_ID),
-+			                   demand_match.score_scan_column};
-+			scan.types = {LogicalType::INTEGER, LogicalType::ROW_TYPE, aggregate.GetChildren()[1]->GetReturnType()};
-+			scan.projection_ids = {0, 1, 2};
-+			auto &bind_columns = scan.bind_data->Cast<TableScanBindData>().column_ids;
-+			bind_columns.clear();
-+			for (const auto &column : scan.column_ids) {
-+				bind_columns.push_back(NumericCast<column_t>(column.GetPrimaryIndex()));
-+			}
-+			vector<unique_ptr<Expression>> selections;
-+			selections.push_back(make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 0));
-+			selections.push_back(make_uniq<BoundReferenceExpression>(LogicalType::ROW_TYPE, 1));
-+			selections.push_back(make_uniq<BoundReferenceExpression>(aggregate.GetChildren()[1]->GetReturnType(), 2));
-+			selections.push_back(aggregate.GetChildren()[2]->Copy());
 +			vector<LogicalType> key_types {LogicalType::INTEGER, LogicalType::BIGINT,
 +			                               aggregate.GetChildren()[1]->GetReturnType(),
 +			                               aggregate.GetChildren()[2]->GetReturnType()};
-+			auto &projection = Make<PhysicalProjection>(std::move(key_types), std::move(selections), input_cardinality);
-+			projection.children.push_back(plan);
++			reference<PhysicalOperator> key_plan = plan;
++			if (owned) {
++				key_plan = Make<PhysicalDummyScan>(key_types, 1);
++			} else {
++				scan.column_ids = {demand_match.group_scan_column, ColumnIndex(COLUMN_IDENTIFIER_ROW_ID),
++				                   demand_match.score_scan_column};
++				scan.types = {LogicalType::INTEGER, LogicalType::ROW_TYPE,
++				              aggregate.GetChildren()[1]->GetReturnType()};
++				scan.projection_ids = {0, 1, 2};
++				auto &bind_columns = scan.bind_data->Cast<TableScanBindData>().column_ids;
++				bind_columns.clear();
++				for (const auto &column : scan.column_ids) {
++					bind_columns.push_back(NumericCast<column_t>(column.GetPrimaryIndex()));
++				}
++				vector<unique_ptr<Expression>> selections;
++				selections.push_back(make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 0));
++				selections.push_back(make_uniq<BoundReferenceExpression>(LogicalType::ROW_TYPE, 1));
++				selections.push_back(
++				    make_uniq<BoundReferenceExpression>(aggregate.GetChildren()[1]->GetReturnType(), 2));
++				selections.push_back(aggregate.GetChildren()[2]->Copy());
++				auto &projection =
++				    Make<PhysicalProjection>(std::move(key_types), std::move(selections), input_cardinality);
++				projection.children.push_back(plan);
++				key_plan = projection;
++			}
 +			const auto fused_option = std::getenv("DUCKDB_DEMAND_FUSED_HANDOFF");
 +			const bool fused_handoff = fused_option && fused_option[0] == '1';
 +			vector<LogicalType> winner_types {LogicalType::INTEGER};
@@ -214,9 +230,10 @@ index 2a127920d8da..f91439c1f014 100644
 +				winner_types.push_back(LogicalType::LIST(LogicalType::BIGINT));
 +			}
 +			auto &topk = Make<PhysicalDemandScoutTopK>(std::move(winner_types), op.estimated_cardinality, *demand_match.table,
-+			                                        demand_match.group_column, demand_match.group_min, demand_match.group_domain,
-+			                                        demand_match.k, input_cardinality, demand_match.score_unsigned, fused_handoff);
-+			topk.children.push_back(projection);
++			                                        demand_match.group_column, demand_match.score_column,
++			                                        demand_match.group_min, demand_match.group_domain, demand_match.k,
++			                                        input_cardinality, demand_match.score_unsigned, fused_handoff, owned);
++			topk.children.push_back(key_plan);
 +			auto &burst = Make<PhysicalDemandBurst>(op.types, op.estimated_cardinality, *demand_match.table,
 +			                                           demand_match.payload_type, std::move(demand_match.payload_columns),
 +			                                           fused_handoff);

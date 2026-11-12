@@ -20,7 +20,7 @@ def require(condition, message):
         raise RuntimeError(message)
 
 
-def run(db, sql, mode="OFF", unique=True):
+def run(db, sql, mode="OFF", unique=True, topology=None, check_route=False):
     env = os.environ.copy()
     for key in list(env):
         if key.startswith("DUCKDB_DEMAND_"):
@@ -28,10 +28,16 @@ def run(db, sql, mode="OFF", unique=True):
     env.update(DUCKDB_DEMAND_SCOUT_TOPK="0" if mode == "OFF" else "1",
                DUCKDB_DEMAND_FUSED_HANDOFF="1" if mode == "DIRECT" else "0",
                DUCKDB_DEMAND_ASSUME_UNIQUE_SCORE="1" if unique else "0")
-    result = subprocess.run([str(CLI), "-no-agent", "-csv", str(db), "-c", sql],
+    if topology:
+        env["DUCKDB_DEMAND_SCOUT_FORCE"] = topology
+        env["DUCKDB_DEMAND_SCOUT_TRACE"] = "1"
+    result = subprocess.run([str(CLI), "-no-agent", "-csv", str(db), "-c", "SET threads=4; " + sql],
                             env=env, capture_output=True, text=True, timeout=60)
     if result.returncode:
         raise RuntimeError(f"{mode}: {result.stderr}")
+    if check_route:
+        require(f"chosen={topology}" in result.stderr,
+                f"{mode}/{topology}: requested topology did not run: {result.stderr}")
     return result.stdout
 
 
@@ -47,13 +53,16 @@ def main():
             "CAST(i%31 AS DOUBLE) v1 FROM range(5000) t(i)")
 
         for k in (1, 3, 5, 10):
-            outputs = [run(db, query(k), mode) for mode in ("OFF", "LIST", "DIRECT")]
-            require(outputs[0] == outputs[1] == outputs[2], f"K={k}: output mismatch")
+            expected = run(db, query(k))
             for mode in ("LIST", "DIRECT"):
                 plan = run(db, "EXPLAIN " + query(k), mode)
                 require("Demand Scout Topk" in plan, f"K={k}: native plan not selected")
                 require(f"Winner Handoff: {mode}" in plan, f"K={k}: wrong handoff")
-            print(f"K={k}: exact OFF/LIST/DIRECT output and plans agree")
+                require(run(db, query(k), mode) == expected, f"K={k}/{mode}: automatic route mismatch")
+                for topology in ("LOCAL", "OWNED", "EXCHANGE"):
+                    actual = run(db, query(k), mode, topology=topology, check_route=True)
+                    require(actual == expected, f"K={k}/{mode}/{topology}: output mismatch")
+            print(f"K={k}: exact OFF/LIST/DIRECT output and three forced topologies agree")
 
         for k in (3, 10):
             cases = (
@@ -62,18 +71,34 @@ def main():
                 "WHERE score=4999; DELETE FROM payload WHERE score=4998; ",
             )
             for prefix in cases:
-                outputs = [run(db, prefix + query(k), mode) for mode in ("OFF", "DIRECT")]
-                require(outputs[0] == outputs[1], f"K={k}: transaction-local mismatch")
-            print(f"K={k}: transaction-local insert/update/delete outputs agree")
+                expected = run(db, prefix + query(k))
+                for topology in ("LOCAL", "OWNED", "EXCHANGE"):
+                    actual = run(db, prefix + query(k), "DIRECT", topology=topology, check_route=True)
+                    require(expected == actual, f"K={k}/{topology}: transaction-local mismatch")
+            print(f"K={k}: transaction-local insert/update/delete outputs agree in all topologies")
 
         for name, sql, unique in (
             ("no unique-score contract", query(3), False),
             ("filtered scan", query(3).replace("FROM payload", "FROM payload WHERE v0>0"), True),
             ("K=11", query(11), True),
         ):
-            plan = run(db, "EXPLAIN " + sql, "DIRECT", unique)
+            plan = run(db, "EXPLAIN " + sql, "DIRECT", unique, topology="OWNED")
             require("Demand Scout Topk" not in plan, f"{name}: expected standard plan")
             print(f"{name}: standard-plan fallback")
+
+        unsigned_db = Path(directory) / "unsigned.duckdb"
+        run(unsigned_db, "CREATE TABLE payload AS SELECT "
+            "CASE WHEN i=0 THEN -200000 WHEN i=1 THEN 200000 "
+            "ELSE CAST((i%37)-18 AS INTEGER) END group_id, "
+            "CAST(i AS BIGINT) logical_id, "
+            "CAST(9223372036854775808 AS UBIGINT)+CAST(i AS UBIGINT) score, "
+            "CAST(i%19 AS DOUBLE) v0, CAST(i%23 AS DOUBLE) v1 FROM range(3000) t(i)")
+        for k in (3, 10):
+            expected = run(unsigned_db, query(k))
+            for topology in ("LOCAL", "OWNED", "EXCHANGE"):
+                actual = run(unsigned_db, query(k), "DIRECT", topology=topology, check_route=True)
+                require(actual == expected, f"UBIGINT/K={k}/{topology}: output mismatch")
+        print("UBIGINT scores above 2^63: exact outputs agree in all topologies")
 
 
 if __name__ == "__main__":

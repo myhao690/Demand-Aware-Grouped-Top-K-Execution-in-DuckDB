@@ -21,7 +21,7 @@ def query(k, width):
             "FROM payload GROUP BY group_id)")
 
 
-def environment(mode):
+def environment(mode, topology=None):
     env = os.environ.copy()
     for key in list(env):
         if key.startswith("DUCKDB_DEMAND_"):
@@ -29,6 +29,9 @@ def environment(mode):
     env.update(DUCKDB_DEMAND_SCOUT_TOPK="0" if mode == "OFF" else "1",
                DUCKDB_DEMAND_FUSED_HANDOFF="1" if mode == "DIRECT" else "0",
                DUCKDB_DEMAND_ASSUME_UNIQUE_SCORE="1")
+    if topology:
+        env["DUCKDB_DEMAND_SCOUT_FORCE"] = topology
+        env["DUCKDB_DEMAND_SCOUT_TRACE"] = "1"
     return env
 
 
@@ -73,12 +76,43 @@ def run_case(db, k, width, threads):
     return rows
 
 
+def run_topology_case(db, k, width, threads):
+    sql = query(k, width)
+    plan = subprocess.run([str(CLI), "-no-agent", "-readonly", str(db), "-c",
+                           f"SET threads={threads}; EXPLAIN " + sql],
+                          env=environment("DIRECT", "OWNED"), capture_output=True, text=True, check=True)
+    if "Demand Scout Topk" not in plan.stdout or "Winner Handoff: DIRECT" not in plan.stdout:
+        raise RuntimeError("specialized plan not selected; check schema and supported SQL shape")
+    query_file = ROOT / ".work/query.sql"
+    query_file.write_text(sql + "\n")
+    rows = []
+    order = ("OFF", "LOCAL", "OWNED", "EXCHANGE", "EXCHANGE", "OWNED", "LOCAL", "OFF")
+    for topology in order:
+        mode = "OFF" if topology == "OFF" else "DIRECT"
+        result = subprocess.run([str(DRIVER), str(db), str(query_file), str(threads), "1", "2"],
+                                env=environment(mode, None if topology == "OFF" else topology),
+                                capture_output=True, text=True, check=True)
+        if topology != "OFF" and f"chosen={topology}" not in result.stderr:
+            raise RuntimeError(f"{topology} path did not run: {result.stderr}")
+        for item in csv.DictReader(io.StringIO(result.stdout)):
+            rows.append(dict(k=k, width=width, threads=threads, handoff=mode, topology=topology, **item))
+    if len({(row["groups"], row["ordered_payload_hash"]) for row in rows}) != 1:
+        raise RuntimeError(f"topology result mismatch for K={k}, W={width}, T={threads}")
+    timings = {topology: statistics.median(float(row["ms"]) for row in rows
+                                           if row["topology"] == topology) for topology in order}
+    print(f"K={k} W={width} T={threads}: " + ", ".join(f"{name} {timings[name]:.2f} ms"
+          for name in ("OFF", "LOCAL", "OWNED", "EXCHANGE")))
+    return rows
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--database", type=Path, help="existing payload database; must satisfy the unique-score contract")
     parser.add_argument("--rows", type=int, default=1_000_000, help="demo rows if --database is omitted")
     parser.add_argument("--groups", type=int, default=50_000, help="demo groups if --database is omitted")
     parser.add_argument("--full", action="store_true", help="K=3/5/10, W=1/6, T=4/8; default is one quick case")
+    parser.add_argument("--topology-matrix", action="store_true",
+                        help="compare OFF against forced LOCAL/OWNED/EXCHANGE with DIRECT handoff")
     args = parser.parse_args()
     if args.rows <= 0 or args.groups <= 0 or args.groups > args.rows:
         parser.error("require 0 < groups <= rows")
@@ -91,8 +125,9 @@ def main():
              for width in (1, 6) for threads in (4, 8)] if args.full else [(10, 6, 4)]
     results = []
     for k, width, threads in cases:
-        results.extend(run_case(db, k, width, threads))
-    output = ROOT / ".work/latest_timings.csv"
+        results.extend(run_topology_case(db, k, width, threads) if args.topology_matrix
+                       else run_case(db, k, width, threads))
+    output = ROOT / (".work/topology_timings.csv" if args.topology_matrix else ".work/latest_timings.csv")
     with output.open("w", newline="") as target:
         writer = csv.DictWriter(target, fieldnames=list(results[0]))
         writer.writeheader()

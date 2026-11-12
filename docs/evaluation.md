@@ -1,6 +1,6 @@
 # Evaluation notes
 
-All times in `results/summary.csv` are from the code in this repository applied to
+All times in `results/summary.csv` and `results/topology_summary.csv` are from the code in this repository applied to
 DuckDB commit `f2b0bad0eb3e47e2060f1f07af9d2069eaf77ea1`. The machine was
 an Apple M4 Pro with 48 GiB of memory (macOS, arm64). These are controlled
 `arg_max` queries, not TPC-H benchmark queries.
@@ -54,6 +54,31 @@ and K = 1, 3, 5, 10.
 
 `results/timings.csv` contains the individual observations. The summary is
 `results/summary.csv`. Differences of a few milliseconds on the smaller bus
-queries should not be read as stable improvements. The path is forced rather
-than selected by an optimizer policy: the negative cases are as important as
-the positive ones.
+queries should not be read as stable improvements. The specialized operator is
+opt-in rather than chosen by the optimizer: the negative cases are as important
+as the positive ones.
+
+## Parallel topology comparison
+
+`results/topology_summary.csv` compares OFF, forced LOCAL, forced OWNED, and
+forced EXCHANGE on the same 48 source/K/width/thread configurations. All three
+specialized arms use DIRECT winner handoff. The run order is OFF, LOCAL, OWNED,
+EXCHANGE, EXCHANGE, OWNED, LOCAL, OFF; each process runs one warm-up and two
+timed queries, giving four timed observations per arm. The published time is
+their median. `results/topology_timings.csv` contains all 768 observations.
+The runner checks the runtime route trace, not just EXPLAIN, and checks that
+group count and `SUM(hash(top))` match across all arms.
+
+OWNED uses one full `DataTable::Scan` of group, physical row ID, and score per
+owner on the query's transaction snapshot. Only the matching owner updates a
+given group's shared Top-K state, so there is no LOCAL-style state merge. The
+ordinary key scan is replaced with a dummy source in this mode. Exact tests
+also cover transaction-local INSERT, UPDATE, DELETE, NULLs, and signed and
+unsigned scores. The automatic selector remains a two-way LOCAL/EXCHANGE
+choice; OWNED is available only by force.
+
+OWNED did not beat LOCAL or EXCHANGE in any of these 48 configurations. This
+does not invalidate earlier standalone experiments: that scanner used direct
+column loops on a synthetic fixture rather than repeated MVCC-visible SQL
+scans. The two implementations have different scan costs, so the earlier
+speedups cannot be transferred to the native operator without measurement.

@@ -8,23 +8,26 @@ class TableCatalogEntry;
 class ClientContext;
 
 // Research-only grouped arg_max(STRUCT, BIGINT/UBIGINT, constant K) specialization.
-// Input still flows through the normal DuckDB table scan and projection.
+// LOCAL/EXCHANGE use the normal scan; forced OWNED repeats a snapshot-visible key scan per owner.
 class PhysicalDemandScoutTopK : public PhysicalOperator {
 public:
 	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::EXTENSION;
 
 	PhysicalDemandScoutTopK(PhysicalPlan &physical_plan, vector<LogicalType> types, idx_t estimated_cardinality,
-	                        TableCatalogEntry &table, column_t group_column, int32_t group_min, idx_t group_domain,
-	                        idx_t k, idx_t input_cardinality, bool score_unsigned, bool fused_handoff);
+	                        TableCatalogEntry &table, column_t group_column, column_t score_column, int32_t group_min,
+	                        idx_t group_domain, idx_t k, idx_t input_cardinality, bool score_unsigned,
+	                        bool fused_handoff, bool owned);
 
 	TableCatalogEntry &table;
 	column_t group_column;
+	column_t score_column;
 	int32_t group_min;
 	idx_t group_domain;
 	idx_t k;
 	idx_t input_cardinality;
 	bool score_unsigned;
 	bool fused_handoff;
+	bool owned;
 
 	vector<int64_t> WinnerRowIds(const Value &group) const;
 

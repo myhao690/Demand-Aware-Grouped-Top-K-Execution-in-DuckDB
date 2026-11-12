@@ -197,6 +197,10 @@ public:
 		const auto local_cost_ns = entries * 8.0 + op.input_cardinality * 0.5;
 		const auto route_cost_ns = op.input_cardinality * 2.5;
 		exchange = threads >= 2 && local_cost_ns > route_cost_ns;
+		owned = op.owned;
+		if (owned) {
+			exchange = false;
+		}
 		if (auto forced = std::getenv("DUCKDB_DEMAND_SCOUT_FORCE")) {
 			if (std::string(forced) == "LOCAL") {
 				exchange = false;
@@ -204,7 +208,80 @@ public:
 				exchange = threads >= 2;
 			}
 		}
-		owners = exchange ? MaxValue<idx_t>(1, threads / 2) : 0;
+		owners = owned ? threads : exchange ? MaxValue<idx_t>(1, threads / 2) : 0;
+		sink_start = std::chrono::steady_clock::now();
+		if (owned) {
+			auto &transaction = DuckTransaction::Get(context, op.table.ParentCatalog());
+			vector<StorageIndex> columns {StorageIndex(op.group_column), StorageIndex(COLUMN_IDENTIFIER_ROW_ID),
+			                              StorageIndex(op.score_column)};
+			vector<LogicalType> types {LogicalType::INTEGER, LogicalType::ROW_TYPE,
+			                           op.score_unsigned ? LogicalType::UBIGINT : LogicalType::BIGINT};
+			for (idx_t owner = 0; owner < owners; ++owner) {
+				auto state = make_uniq<TableScanState>();
+				op.table.GetStorage().InitializeScan(context, transaction, *state, columns);
+				owned_states.push_back(std::move(state));
+				auto chunk = make_uniq<DataChunk>();
+				chunk->Initialize(Allocator::Get(context), types);
+				owned_chunks.push_back(std::move(chunk));
+			}
+			for (idx_t owner = 0; owner < owners; ++owner) {
+				owned_workers.emplace_back([this, &op, &transaction, owner] {
+					try {
+						auto &chunk = *owned_chunks[owner];
+						while (true) {
+							chunk.Reset();
+							op.table.GetStorage().Scan(transaction, chunk, *owned_states[owner]);
+							if (chunk.size() == 0) {
+								break;
+							}
+							input_rows.fetch_add(chunk.size(), std::memory_order_relaxed);
+							UnifiedVectorFormat groups, ids, scores;
+							chunk.data[0].ToUnifiedFormat(groups);
+							chunk.data[1].ToUnifiedFormat(ids);
+							chunk.data[2].ToUnifiedFormat(scores);
+							const auto group_data = groups.GetData<int32_t>();
+							const auto id_data = ids.GetData<int64_t>();
+							const auto signed_score_data = op.score_unsigned ? nullptr : scores.GetData<int64_t>();
+							const auto unsigned_score_data = op.score_unsigned ? scores.GetData<uint64_t>() : nullptr;
+							for (idx_t row = 0; row < chunk.size(); ++row) {
+								const auto group_index = groups.sel->get_index(row);
+								const auto id_index = ids.sel->get_index(row);
+								const auto score_index = scores.sel->get_index(row);
+								const auto group = groups.validity.RowIsValid(group_index)
+								                       ? static_cast<int64_t>(group_data[group_index]) -
+								                             static_cast<int64_t>(op.group_min)
+								                       : static_cast<int64_t>(op.group_domain);
+								if (group < 0 || static_cast<idx_t>(group) > op.group_domain) {
+									throw InvalidInputException(
+									    "Demand research Top-K group outside statistics-derived domain");
+								}
+								const auto target = static_cast<idx_t>(group);
+								if (target % owners != owner) {
+									continue;
+								}
+								seen[target] = 1;
+								const auto valid =
+								    ids.validity.RowIsValid(id_index) && scores.validity.RowIsValid(score_index);
+								if (!valid) {
+									continue;
+								}
+								valid_rows.fetch_add(1, std::memory_order_relaxed);
+								const auto normalized_score =
+								    op.score_unsigned
+								        ? unsigned_score_data[score_index]
+								        : (static_cast<uint64_t>(signed_score_data[score_index]) ^ (uint64_t(1) << 63));
+								heaps.Add(target, {normalized_score, id_data[id_index]});
+							}
+						}
+					} catch (...) {
+						std::lock_guard<std::mutex> guard(error_lock);
+						if (!worker_error) {
+							worker_error = std::current_exception();
+						}
+					}
+				});
+			}
+		}
 		if (exchange) {
 			for (idx_t owner = 0; owner < owners; ++owner) {
 				queues.push_back(make_uniq<KeyQueue>());
@@ -237,10 +314,12 @@ public:
 			}
 		}
 		if (auto trace = std::getenv("DUCKDB_DEMAND_SCOUT_TRACE"); trace && trace[0] == '1') {
-			std::cerr << "DEMAND_SCOUT estimated_groups=" << estimated_groups
-			          << " chosen=" << (exchange ? "EXCHANGE" : "LOCAL") << " workers=" << threads << '\n';
+			std::cerr << "DEMAND_SCOUT estimated_groups=" << estimated_groups << " chosen="
+			          << (owned      ? "OWNED"
+			              : exchange ? "EXCHANGE"
+			                         : "LOCAL")
+			          << " workers=" << threads << '\n';
 		}
-		sink_start = std::chrono::steady_clock::now();
 	}
 	~ScoutSinkState() override {
 		for (auto &queue : queues) {
@@ -251,19 +330,28 @@ public:
 				consumer.join();
 			}
 		}
+		for (auto &worker : owned_workers) {
+			if (worker.joinable()) {
+				worker.join();
+			}
+		}
 	}
 	idx_t MaxThreads(idx_t source_max_threads) override {
-		return exchange ? MinValue(source_max_threads, owners) : source_max_threads;
+		return owned ? 1 : exchange ? MinValue(source_max_threads, owners) : source_max_threads;
 	}
 	PackedTopK heaps;
 	std::vector<uint8_t> seen;
-	bool exchange = false, finished = false;
+	bool exchange = false, owned = false, finished = false;
 	idx_t owners = 0;
 	std::mutex combine_lock;
 	std::mutex error_lock;
 	std::vector<unique_ptr<KeyQueue>> queues;
 	std::vector<std::thread> consumers;
 	std::exception_ptr consumer_error;
+	std::vector<unique_ptr<TableScanState>> owned_states;
+	std::vector<unique_ptr<DataChunk>> owned_chunks;
+	std::vector<std::thread> owned_workers;
+	std::exception_ptr worker_error;
 	unique_ptr<StorageLockKey> vacuum_lock;
 	std::chrono::steady_clock::time_point sink_start;
 	double sample_ms = 0;
@@ -272,7 +360,11 @@ public:
 
 class ScoutLocalState : public LocalSinkState {
 public:
-	ScoutLocalState(const PhysicalDemandScoutTopK &op, ScoutSinkState &global) : exchange(global.exchange) {
+	ScoutLocalState(const PhysicalDemandScoutTopK &op, ScoutSinkState &global)
+	    : exchange(global.exchange), owned(global.owned) {
+		if (owned) {
+			return;
+		}
 		if (exchange) {
 			buffers.resize(global.owners);
 			for (auto &buffer : buffers) {
@@ -284,6 +376,7 @@ public:
 		}
 	}
 	bool exchange;
+	bool owned;
 	PackedTopK heaps;
 	std::vector<uint8_t> seen;
 	std::vector<std::vector<KeyTuple>> buffers;
@@ -300,11 +393,13 @@ public:
 
 PhysicalDemandScoutTopK::PhysicalDemandScoutTopK(PhysicalPlan &physical_plan, vector<LogicalType> types,
                                                  idx_t estimated_cardinality, TableCatalogEntry &table,
-                                                 column_t group_column, int32_t group_min, idx_t group_domain, idx_t k,
-                                                 idx_t input_cardinality, bool score_unsigned, bool fused_handoff)
+                                                 column_t group_column, column_t score_column, int32_t group_min,
+                                                 idx_t group_domain, idx_t k, idx_t input_cardinality,
+                                                 bool score_unsigned, bool fused_handoff, bool owned)
     : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, std::move(types), estimated_cardinality),
-      table(table), group_column(group_column), group_min(group_min), group_domain(group_domain), k(k),
-      input_cardinality(input_cardinality), score_unsigned(score_unsigned), fused_handoff(fused_handoff) {
+      table(table), group_column(group_column), score_column(score_column), group_min(group_min),
+      group_domain(group_domain), k(k), input_cardinality(input_cardinality), score_unsigned(score_unsigned),
+      fused_handoff(fused_handoff), owned(owned) {
 }
 
 string PhysicalDemandScoutTopK::GetName() const {
@@ -332,6 +427,9 @@ SinkResultType PhysicalDemandScoutTopK::Sink(ExecutionContext &context, DataChun
                                              OperatorSinkInput &input) const {
 	auto &global = input.global_state.Cast<ScoutSinkState>();
 	auto &local = input.local_state.Cast<ScoutLocalState>();
+	if (global.owned) {
+		return SinkResultType::NEED_MORE_INPUT;
+	}
 	const auto profile = ProfileScout();
 	if (profile) {
 		local.input_rows += chunk.size();
@@ -385,6 +483,9 @@ SinkCombineResultType PhysicalDemandScoutTopK::Combine(ExecutionContext &context
                                                        OperatorSinkCombineInput &input) const {
 	auto &global = input.global_state.Cast<ScoutSinkState>();
 	auto &local = input.local_state.Cast<ScoutLocalState>();
+	if (global.owned) {
+		return SinkCombineResultType::FINISHED;
+	}
 	if (ProfileScout()) {
 		global.input_rows.fetch_add(local.input_rows, std::memory_order_relaxed);
 		global.valid_rows.fetch_add(local.valid_rows, std::memory_order_relaxed);
@@ -418,8 +519,16 @@ SinkFinalizeType PhysicalDemandScoutTopK::Finalize(Pipeline &pipeline, Event &ev
 			consumer.join();
 		}
 	}
+	for (auto &worker : global.owned_workers) {
+		if (worker.joinable()) {
+			worker.join();
+		}
+	}
 	if (global.consumer_error) {
 		std::rethrow_exception(global.consumer_error);
+	}
+	if (global.worker_error) {
+		std::rethrow_exception(global.worker_error);
 	}
 	if (ProfileScout()) {
 		idx_t groups = 0, winners = 0;
@@ -430,7 +539,11 @@ SinkFinalizeType PhysicalDemandScoutTopK::Finalize(Pipeline &pipeline, Event &ev
 		std::cerr << "DEMAND_SCOUT_PROFILE input_rows=" << global.input_rows.load()
 		          << " valid_rows=" << global.valid_rows.load() << " groups=" << groups << " winners=" << winners
 		          << " sample_ms=" << global.sample_ms << " sink_wall_ms=" << ScoutElapsedMs(global.sink_start)
-		          << " route=" << (global.exchange ? "EXCHANGE" : "LOCAL") << '\n';
+		          << " route="
+		          << (global.owned      ? "OWNED"
+		              : global.exchange ? "EXCHANGE"
+		                                : "LOCAL")
+		          << '\n';
 	}
 	global.finished = true;
 	return SinkFinalizeType::READY;
